@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slice 01 — Pre-Render Structural Templates</title>
+<style>
+  :root {
+    --bg: #fff; --fg: #1a1a1a; --muted: #666; --border: #e0e0e0;
+    --accent: #2563eb; --accent-bg: #eff6ff; --code-bg: #f5f5f5;
+    --tag: #dbeafe; --tag-fg: #1e40af;
+  }
+  html.dark {
+    --bg: #181a1b; --fg: #d4d4d4; --muted: #999; --border: #333;
+    --accent: #60a5fa; --accent-bg: #1e293b; --code-bg: #232526;
+    --tag: #1e3a5f; --tag-fg: #93c5fd;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.55; max-width: 58rem; margin: 0 auto; padding: 2rem 1.5rem; }
+  h1 { font-size: 1.25rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1rem; margin-top: 1.6rem; margin-bottom: 0.4rem; color: var(--accent); text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em; }
+  h3 { font-size: 0.92rem; margin-top: 1rem; margin-bottom: 0.3rem; }
+  p, li { margin-bottom: 0.35rem; font-size: 0.87rem; }
+  ul, ol { padding-left: 1.2rem; }
+  pre { background: var(--code-bg); padding: 0.5rem 0.7rem; border-radius: 4px; overflow-x: auto; font-size: 0.76rem; line-height: 1.4; margin: 0.4rem 0; }
+  code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.82em; }
+  .subtitle { color: var(--muted); font-size: 0.82rem; margin-bottom: 1.2rem; }
+  .tag { display: inline-block; background: var(--tag); color: var(--tag-fg); font-size: 0.7rem; font-weight: 600; padding: 0.1em 0.4em; border-radius: 3px; margin-right: 0.3rem; }
+  .section { border-left: 2px solid var(--border); padding-left: 0.8rem; margin: 1rem 0; }
+  .gw { border-color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; margin: 0.5rem 0; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 0.25rem 0.5rem; border: 1px solid var(--border); }
+  th { background: var(--accent-bg); font-weight: 600; }
+  #theme-toggle { position: fixed; top: 0.75rem; right: 0.75rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 0.75rem; color: var(--fg); }
+</style>
+<script>
+  (function(){var t=localStorage.getItem('theme');if(t==='dark'||((!t)&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.classList.add('dark')})();
+</script>
+</head>
+<body>
+<button id="theme-toggle" onclick="document.documentElement.classList.toggle('dark');localStorage.setItem('theme',document.documentElement.classList.contains('dark')?'dark':'light')">theme</button>
+
+<h1>01 — Pre-Render Structural Templates</h1>
+<p class="subtitle">Execute Go text/template on raw YAML bytes before parsing, enabling template expressions to produce non-scalar YAML values (arrays, objects).</p>
+
+<h2>User Story</h2>
+<p>As a <strong>platform team deploying APIs in immutable mode</strong>, I want template expressions in artifact YAML files to produce arrays and objects so that I can share a single API definition across environments where only env-var-driven values differ.</p>
+
+<h2>Outer Boundary</h2>
+<div class="section gw">
+<p><span class="tag">Entry</span> <code>pkg/immutable/loader.go</code> — <code>LoadArtifacts()</code> boot path</p>
+<p><span class="tag">Test Surface</span> Unit tests on the pre-render function + integration test via <code>gateway/it/features/</code></p>
+<p><span class="tag">Framework</span> Go <code>text/template</code>, standard <code>yaml.Unmarshal</code></p>
+</div>
+
+<h2>Shell Boundaries</h2>
+<table>
+<tr><th>Type</th><th>Component</th><th>Role</th></tr>
+<tr><td>FS</td><td><code>immutable/loader.go</code></td><td>Reads artifact files, inserts pre-render between read and kind-sniff parse</td></tr>
+</table>
+
+<h2>Functional Core</h2>
+<p>Discovered via TDD. Expected shape:</p>
+<ul>
+<li><code>BuildStructuralFuncMap() template.FuncMap</code> — returns only structural functions (<code>env</code>, <code>required</code>, <code>default</code>, <code>upper</code>, <code>lower</code>, <code>trim</code>, <code>replace</code>). No <code>secret</code>, no <code>redact</code>.</li>
+<li><code>PreRender(raw []byte, funcMap template.FuncMap) ([]byte, error)</code> — executes template on raw bytes, returns rendered bytes.</li>
+</ul>
+
+<h2>Acceptance Criterion</h2>
+<div class="section">
+<p><strong>Given</strong> an artifact YAML file with <code>issuers: {{ env "ISSUERS" | required "ISSUERS must be set" }}</code> (unquoted)</p>
+<p><strong>And</strong> the env var <code>ISSUERS=[bit-ai-kc-ref, eiam-r]</code></p>
+<p><strong>When</strong> the gateway controller boots in immutable mode</p>
+<p><strong>Then</strong> the loaded config has <code>issuers</code> as a <code>[]interface{}{"bit-ai-kc-ref", "eiam-r"}</code> (real array, not a string)</p>
+<p><strong>And</strong> scalar template fields (e.g. <code>url: '{{ env "URL" }}'</code>) still resolve correctly</p>
+<p><strong>And</strong> <code>{{ secret "X" }}</code> in scalar fields still resolves with redaction tracking in pass 2</p>
+</div>
+
+<h2>Test List</h2>
+<ol>
+<li>Pre-render resolves <code>{{ env "X" }}</code> in raw bytes, producing valid YAML</li>
+<li>Pre-render with no <code>{{ }}</code> expressions returns bytes unchanged</li>
+<li>Pre-render with missing required env var returns error</li>
+<li>Pre-render does NOT resolve <code>{{ secret "X" }}</code> — function not in structural FuncMap (returns parse/execution error or is excluded)</li>
+<li>After pre-render + YAML parse, array-typed field contains real <code>[]interface{}</code></li>
+<li>Scalar fields with YAML-quoted templates (<code>'{{ env "URL" }}'</code>) resolve to strings after pre-render + parse</li>
+<li>Pass 2 (<code>RenderSpec</code>) still resolves <code>{{ secret "X" }}</code> with tracker in scalar leaves</li>
+<li>Pass 2 skips already-resolved fields (no <code>{{</code> remaining after pass 1)</li>
+<li><code>{{ env "KEY" | redact }}</code> in YAML-quoted scalar — pass 1 resolves env, but <code>redact</code> not in structural FuncMap, so expression is left for pass 2 (OR: include <code>redact</code> as no-op passthrough in pass 1)</li>
+<li>Integration test: LlmProvider with templated issuers/audiences loads successfully and policy engine receives real arrays</li>
+</ol>
+
+<h2>Decision Context</h2>
+<div class="section">
+<h3>Problem</h3>
+<p>Template expressions in array-typed fields fail because YAML parsing happens before template rendering. Templates can only produce strings, never arrays.</p>
+
+<h3>Chosen Approach</h3>
+<p>Two-pass rendering: pass 1 executes structural template functions on raw YAML bytes before parsing; pass 2 (existing <code>RenderSpec</code>) handles secret resolution and redaction tracking on parsed struct leaves.</p>
+
+<h3>Alternatives Considered</h3>
+<ul>
+<li><strong>Custom <code>fromJson</code>/<code>split</code> function</strong> — rejected: even if the function produced a list, the rendered output is placed into a string field in <code>map[string]any</code>, never promoted to <code>[]any</code></li>
+<li><strong>Single-pass raw-bytes render with all functions</strong> — rejected: breaks <code>secret</code>/<code>redact</code> tracking (tracker lives in <code>RenderSpec</code> context); would require wiring tracker into a pre-parse context and handling double-render conflicts</li>
+<li><strong>Full-copy per environment</strong> — current workaround, doesn't scale (15 files vs 5)</li>
+</ul>
+
+<h3>Constraints</h3>
+<ul>
+<li>Separate FuncMaps enforce the pass-1/pass-2 split at compile time (contract-strength coupling)</li>
+<li>Scoped to immutable loader only — management API doesn't need pre-render</li>
+<li>Users must not YAML-quote array template expressions (same as Helm)</li>
+</ul>
+</div>
+
+<h2>Open Questions</h2>
+<ul>
+<li><strong><code>redact</code> in pass 1</strong> — should <code>BuildStructuralFuncMap</code> include <code>redact</code> as a no-op passthrough (so <code>{{ env "X" | redact }}</code> resolves in pass 1 without tracking), or exclude it (leaving the expression for pass 2)? Excluding it means YAML-quoted scalar fields with <code>| redact</code> still work via pass 2; including it as no-op means they resolve in pass 1 but lose redaction tracking. <em>Recommendation: exclude <code>redact</code> from pass 1. Quoted scalars are preserved through YAML parse as strings, so pass 2 handles them correctly.</em></li>
+</ul>
+
+<h2>Uses</h2>
+<ul>
+<li><code>pkg/templateengine/funcs/registry.go</code> — existing function registry (reuse <code>env</code>, <code>required</code>, <code>default</code> implementations)</li>
+<li><code>pkg/templateengine/render.go</code> — existing <code>render()</code> function (template parse + execute)</li>
+<li><code>pkg/immutable/loader.go</code> — insert point between <code>os.ReadFile</code> and <code>parser.Parse</code></li>
+</ul>
+
+</body>
+</html>

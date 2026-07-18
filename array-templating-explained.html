@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why Array Templating Fails &amp; How Pre-Render Fixes It</title>
+<style>
+  :root {
+    --bg: #fff; --fg: #1a1a1a; --muted: #666; --border: #e0e0e0;
+    --accent: #2563eb; --accent-bg: #eff6ff; --code-bg: #f5f5f5;
+    --ok: #dcfce7; --ok-border: #86efac; --fail: #fee2e2; --fail-border: #fca5a5;
+    --step: #fef3c7; --step-border: #fcd34d;
+  }
+  html.dark {
+    --bg: #181a1b; --fg: #d4d4d4; --muted: #999; --border: #333;
+    --accent: #60a5fa; --accent-bg: #1e293b; --code-bg: #232526;
+    --ok: #052e16; --ok-border: #166534; --fail: #450a0a; --fail-border: #991b1b;
+    --step: #422006; --step-border: #92400e;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.55; max-width: 62rem; margin: 0 auto; padding: 2rem 1.5rem; }
+  h1 { font-size: 1.35rem; margin-bottom: 0.3rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; margin-bottom: 0.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.2rem; }
+  h3 { font-size: 0.95rem; margin-top: 1.2rem; margin-bottom: 0.3rem; }
+  p, li { margin-bottom: 0.4rem; font-size: 0.88rem; }
+  ul, ol { padding-left: 1.3rem; }
+  pre { background: var(--code-bg); padding: 0.6rem 0.8rem; border-radius: 4px; overflow-x: auto; font-size: 0.76rem; line-height: 1.45; margin: 0.5rem 0; }
+  code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.82em; }
+  .subtitle { color: var(--muted); font-size: 0.82rem; margin-bottom: 1.5rem; }
+  .box { padding: 0.6rem 0.8rem; border-radius: 4px; margin: 0.6rem 0; font-size: 0.84rem; border-left: 3px solid; }
+  .box-fail { background: var(--fail); border-color: var(--fail-border); }
+  .box-ok { background: var(--ok); border-color: var(--ok-border); }
+  .box-step { background: var(--step); border-color: var(--step-border); }
+  .pipeline { display: grid; grid-template-columns: 1fr auto 1fr; gap: 0.3rem; align-items: start; margin: 1rem 0; }
+  .pipeline-label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; color: var(--muted); letter-spacing: 0.03em; text-align: center; padding-top: 0.3rem; }
+  .arrow { font-size: 1.2rem; color: var(--muted); text-align: center; padding-top: 1.5rem; }
+  table { width: 100%; border-collapse: collapse; margin: 0.6rem 0; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 0.3rem 0.5rem; border: 1px solid var(--border); }
+  th { background: var(--accent-bg); font-weight: 600; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 700px) { .cols { grid-template-columns: 1fr; } }
+  #theme-toggle { position: fixed; top: 0.75rem; right: 0.75rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 0.75rem; color: var(--fg); }
+  .highlight { background: var(--accent-bg); padding: 0.1rem 0.3rem; border-radius: 3px; }
+</style>
+<script>
+  (function(){var t=localStorage.getItem('theme');if(t==='dark'||((!t)&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.classList.add('dark')})();
+</script>
+</head>
+<body>
+<button id="theme-toggle" onclick="document.documentElement.classList.toggle('dark');localStorage.setItem('theme',document.documentElement.classList.contains('dark')?'dark':'light')">theme</button>
+
+<h1>Why Array Templating Fails &amp; How Pre-Render Fixes It</h1>
+<p class="subtitle">The core problem is ordering: YAML parse happens before template render, so templates can never produce non-string values.</p>
+
+<h2>The Current Pipeline (Today)</h2>
+
+<pre><code>os.ReadFile(path)        &rarr; raw []byte         (template syntax still in text)
+        &darr;
+yaml.Unmarshal(data)     &rarr; typed Go struct    (template syntax trapped in string fields)
+        &darr;
+json.Marshal &rarr; map      &rarr; map[string]any    (generic tree, but types are locked in)
+        &darr;
+renderValue(leaf)        &rarr; each string with {{ }} is executed through text/template
+        &darr;
+json.Marshal &rarr; Unmarshal &rarr; back to typed struct (rendered values must fit the field type)</code></pre>
+
+<h3>Walk through the failure</h3>
+
+<p>Consider this artifact YAML:</p>
+
+<pre><code>spec:
+  policies:
+    - name: jwt-auth
+      params:
+        issuers: '{{ env "ISSUERS" | required "ISSUERS must be set" }}'</code></pre>
+
+<p>With <code>ISSUERS=[bit-ai-kc-ref, eiam-r]</code> in the environment.</p>
+
+<div class="box box-step"><strong>Step 1: YAML parse.</strong> The parser sees <code>issuers: '{{ env "ISSUERS" ... }}'</code>. The single-quotes make it a YAML scalar string. The <code>params</code> field is <code>map[string]interface{}</code>, so the parser stores:<br><br><code>params["issuers"] = "{{ env \"ISSUERS\" | required \"ISSUERS must be set\" }}"</code> &mdash; a single Go string.</div>
+
+<div class="box box-step"><strong>Step 2: Template render.</strong> <code>renderValue</code> finds this string contains <code>{{</code>, executes the template. <code>env("ISSUERS")</code> returns <code>"[bit-ai-kc-ref, eiam-r]"</code> (literally that text, including brackets). <code>required</code> checks it's non-empty, passes it through.<br><br>Result: <code>params["issuers"] = "[bit-ai-kc-ref, eiam-r]"</code> &mdash; still a single Go string.</div>
+
+<div class="box box-fail"><strong>Step 3: Re-marshal into typed struct.</strong> <code>json.Marshal(map)</code> produces <code>"issuers": "[bit-ai-kc-ref, eiam-r]"</code> (a JSON string, not a JSON array). When downstream code expects <code>[]string</code> for issuers, it gets a single string element containing brackets. The policy engine receives garbage.</div>
+
+<h3>The fundamental constraint</h3>
+
+<p>Once YAML parsing runs, every value has a Go type. A string field stays a string no matter what the template produces. The template output is <em>always placed back as a string</em> in the <code>map[string]any</code> tree. There's no mechanism to "promote" a rendered string into an array after the fact.</p>
+
+<div class="box box-fail"><strong>Even with <code>map[string]interface{}</code> params:</strong> the YAML parser saw a quoted scalar, so it stored a <code>string</code>. The template engine renders string &rarr; string. The final <code>json.Unmarshal</code> sees <code>"issuers": "[bit-ai-kc-ref, eiam-r]"</code> which is a JSON string, not <code>["bit-ai-kc-ref", "eiam-r"]</code> which would be a JSON array.</div>
+
+<h2>The Proposed Solution: Pre-Render on Raw Bytes</h2>
+
+<pre><code>os.ReadFile(path)            &rarr; raw []byte       (template syntax in text)
+        &darr;
+<strong>template.Execute(raw)</strong>        &rarr; rendered []byte  <strong>&larr; NEW: template runs on raw YAML text</strong>
+        &darr;
+yaml.Unmarshal(rendered)     &rarr; typed Go struct  (parser sees valid YAML with real arrays)
+        &darr;
+renderValue(leaf)            &rarr; second pass for secret/redact tracking only
+        &darr;
+json.Marshal &rarr; Unmarshal    &rarr; typed struct (everything fits)</code></pre>
+
+<h3>Walk through the fix</h3>
+
+<p>Same artifact, but without YAML quoting (since the template runs on raw text):</p>
+
+<pre><code>spec:
+  policies:
+    - name: jwt-auth
+      params:
+        issuers: {{ env "ISSUERS" | required "ISSUERS must be set" }}</code></pre>
+
+<p>With <code>ISSUERS=[bit-ai-kc-ref, eiam-r]</code> in the environment.</p>
+
+<div class="box box-step"><strong>Step 1: Template execute on raw bytes.</strong> Go's <code>text/template</code> sees the <code>{{ }}</code>, calls <code>env("ISSUERS")</code> which returns <code>[bit-ai-kc-ref, eiam-r]</code>. The template output replaces the expression in the raw text.<br><br>The raw bytes now read:
+<pre><code>spec:
+  policies:
+    - name: jwt-auth
+      params:
+        issuers: [bit-ai-kc-ref, eiam-r]</code></pre>
+This is <strong>valid YAML</strong> &mdash; a flow sequence.</div>
+
+<div class="box box-ok"><strong>Step 2: YAML parse.</strong> The parser sees <code>issuers: [bit-ai-kc-ref, eiam-r]</code> and correctly produces:<br><br><code>params["issuers"] = []interface{}{"bit-ai-kc-ref", "eiam-r"}</code> &mdash; a real Go slice.</div>
+
+<div class="box box-ok"><strong>Step 3: Everything downstream works.</strong> The typed struct gets a proper <code>[]string</code>. Policy engine receives a real array. No garbage.</div>
+
+<h2>Why This Works (the Key Insight)</h2>
+
+<p>The template output becomes part of the <strong>YAML syntax itself</strong>. When the env var value is <code>[bit-ai-kc-ref, eiam-r]</code>, the rendered text contains a YAML flow sequence. The YAML parser then interprets it as structure, not as a string.</p>
+
+<div class="cols">
+<div>
+<h3>Post-parse render (today)</h3>
+<pre><code>Template input:  a Go string
+Template output: a Go string
+Context: string &rarr; string
+Cannot change type.</code></pre>
+</div>
+<div>
+<h3>Pre-parse render (proposed)</h3>
+<pre><code>Template input:  raw text bytes
+Template output: raw text bytes
+Context: text &rarr; YAML parser
+Can produce any YAML structure.</code></pre>
+</div>
+</div>
+
+<h2>The Redaction Complication</h2>
+
+<p>The existing <code>secret</code> and <code>redact</code> template functions track sensitive values via <code>SecretTracker</code> during rendering. If we only do pre-render, we'd need the tracker wired into the pre-render pass. But there's a clean two-pass solution:</p>
+
+<table>
+<tr><th>Pass</th><th>What runs</th><th>Purpose</th></tr>
+<tr><td>1 (pre-parse)</td><td><code>env</code>, <code>required</code>, <code>default</code>, <code>upper</code>, <code>lower</code>, <code>trim</code>, <code>replace</code></td><td>Structural: produces valid YAML (arrays, objects)</td></tr>
+<tr><td>2 (post-parse, existing)</td><td><code>secret</code>, <code>redact</code> + all others</td><td>Secret resolution + tracking for config-dump redaction</td></tr>
+</table>
+
+<p>Pass 1 handles the structural problem (arrays). Pass 2 handles secrets with tracking intact. Existing scalar templates (<code>{{ env "URL" }}</code>) work in both passes &mdash; they're idempotent on already-resolved values since they won't contain <code>{{</code> anymore after pass 1.</p>
+
+<div class="box box-ok"><strong>Backward compatible:</strong> artifacts that only use templates in scalar string fields still work. Pass 1 resolves them to plain strings, YAML parses the string, pass 2 finds no remaining <code>{{</code> and skips them.</div>
+
+<h2>Corrected Template Syntax</h2>
+
+<p>The feature request incorrectly shows <code>{{ required "ISSUERS" }}</code>. The actual <code>required</code> function takes <code>(msg, val string)</code> for pipe compatibility. Correct syntax:</p>
+
+<div class="cols">
+<div>
+<h3>Wrong (feature request)</h3>
+<pre><code>issuers: {{ required "ISSUERS" }}
+audiences: {{ required "AUDIENCES" }}</code></pre>
+<p style="font-size:0.78rem;color:var(--muted)"><code>required</code> expects 2 args: error message + value</p>
+</div>
+<div>
+<h3>Correct</h3>
+<pre><code>issuers: {{ env "ISSUERS" | required "ISSUERS must be set" }}
+audiences: {{ env "AUDIENCES" | required "AUDIENCES must be set" }}</code></pre>
+<p style="font-size:0.78rem;color:var(--muted)"><code>env</code> fetches, pipes into <code>required</code> which validates non-empty</p>
+</div>
+</div>
+
+<h2>Summary</h2>
+
+<table>
+<tr><th>Question</th><th>Answer</th></tr>
+<tr><td>Difficulty</td><td>Medium-low. ~50-100 lines of new code, clean insert point.</td></tr>
+<tr><td>Breaking change?</td><td>No. Additive only. Existing templates produce identical results.</td></tr>
+<tr><td>Risk</td><td>Low. Pre-render on inert text is a no-op. Only templates with <code>{{</code> are affected.</td></tr>
+<tr><td>Worth upstreaming?</td><td>Yes. It's an architectural gap (ordering bug), not a design choice. Matches Helm mental model.</td></tr>
+<tr><td>Main complication</td><td>Wiring the redaction tracker &mdash; solved with two-pass approach.</td></tr>
+<tr><td>Entry points to modify</td><td>2-3: immutable loader (boot), management API (runtime), event listener (CP sync)</td></tr>
+</table>
+
+</body>
+</html>

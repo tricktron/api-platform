@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feature Request: Raw-YAML Artifact Templating (Array Support)</title>
+<style>
+  :root {
+    --bg: #fff; --fg: #1a1a1a; --muted: #666; --border: #e0e0e0;
+    --accent: #2563eb; --accent-bg: #eff6ff; --code-bg: #f5f5f5;
+    --table-stripe: #fafafa; --env: #fef3c7; --const: #dcfce7; --danger: #fee2e2;
+    --future: #d1fae5;
+  }
+  html.dark {
+    --bg: #181a1b; --fg: #d4d4d4; --muted: #999; --border: #333;
+    --accent: #60a5fa; --accent-bg: #1e293b; --code-bg: #232526;
+    --table-stripe: #1f2122; --env: #422006; --const: #14532d; --danger: #450a0a;
+    --future: #064e3b;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.55; max-width: 60rem; margin: 0 auto; padding: 2rem 1.5rem; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 2rem; margin-bottom: 0.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.2rem; }
+  h3 { font-size: 1rem; margin-top: 1.2rem; margin-bottom: 0.3rem; }
+  p, li { margin-bottom: 0.4rem; font-size: 0.9rem; }
+  ul { padding-left: 1.3rem; }
+  pre { background: var(--code-bg); padding: 0.6rem; border-radius: 4px; overflow-x: auto; font-size: 0.78rem; line-height: 1.4; margin: 0.4rem 0; }
+  code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.82em; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+  .note { background: var(--env); padding: 0.5rem 0.7rem; border-radius: 4px; font-size: 0.82rem; margin: 0.5rem 0; }
+  .danger { background: var(--danger); padding: 0.5rem 0.7rem; border-radius: 4px; font-size: 0.82rem; margin: 0.5rem 0; }
+  .future { background: var(--future); padding: 0.5rem 0.7rem; border-radius: 4px; font-size: 0.82rem; margin: 0.5rem 0; }
+  .verdict { background: var(--accent-bg); border-left: 3px solid var(--accent); padding: 0.6rem 0.8rem; margin: 1rem 0; border-radius: 0 4px 4px 0; font-size: 0.9rem; }
+  table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 0.3rem 0.5rem; border: 1px solid var(--border); }
+  th { background: var(--accent-bg); font-weight: 600; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 700px) { .cols { grid-template-columns: 1fr; } }
+  #theme-toggle { position: fixed; top: 0.75rem; right: 0.75rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 0.8rem; color: var(--fg); }
+</style>
+<script>
+  (function(){var t=localStorage.getItem('theme');if(t==='dark'||((!t)&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.classList.add('dark')})();
+</script>
+</head>
+<body>
+<button id="theme-toggle" onclick="document.documentElement.classList.toggle('dark');localStorage.setItem('theme',document.documentElement.classList.contains('dark')?'dark':'light')">theme</button>
+
+<h1>Feature Request: Raw-YAML Artifact Templating</h1>
+<p class="subtitle">Enable Go text/template rendering on raw YAML bytes before parsing, so template expressions can produce non-scalar values (arrays, objects)</p>
+
+<h2>Problem</h2>
+
+<p>The Gateway Controller's artifact templating currently renders Go <code>text/template</code> expressions on <strong>individual string leaf values</strong> extracted from an already-parsed Go struct. The processing order is:</p>
+
+<pre><code>1. os.ReadFile(path)              → raw []byte
+2. yaml.Unmarshal(data, &struct)  → typed Go struct (arrays become []string)
+3. renderValue(leaf)              → template executes on each string field
+4. json.Marshal → json.Unmarshal  → back into typed struct</code></pre>
+
+<p>Because YAML parsing happens <strong>before</strong> template rendering, template expressions can only produce scalar string values. A template expression in an array-typed field fails because the YAML parser needs to see a real list, and the rendered string <code>[a, b, c]</code> is treated as a JSON string (not a JSON array) during the final <code>json.Unmarshal</code>.</p>
+
+<h3>Concrete failing example</h3>
+
+<p>A <code>LlmProvider</code> definition with per-environment JWT issuers:</p>
+
+<pre><code># This DOES NOT WORK today
+apiVersion: gateway.api-platform.wso2.com/v1alpha1
+kind: LlmProvider
+metadata:
+  name: ai-model-deepseek
+spec:
+  context: "/ai-model/deepseek/shared/v1"
+  upstream:
+    url: '{{ env "MODEL_BACKEND_URL" | required "MODEL_BACKEND_URL must be set" }}'    # ← works (scalar string field)
+  policies:
+    - name: jwt-auth
+      version: v1
+      paths:
+        - path: "/*"
+          params:
+            issuers: '{{ env "ISSUERS" | required "ISSUERS must be set" }}'  # ← FAILS: issuers is []string
+            audiences: '{{ env "AUDIENCES" | required "AUDIENCES must be set" }}'  # ← FAILS: audiences is []string</code></pre>
+
+<div class="danger">
+<strong>Why it fails:</strong> After YAML parse, the <code>issuers</code> field expects <code>[]string</code>. The YAML value <code>'{{ env "ISSUERS" | required "ISSUERS must be set" }}'</code> is a scalar string, so <code>yaml.Unmarshal</code> into <code>[]string</code> fails. Even if it were accepted as a single-element list, the rendered string <code>[bit-ai-kc-ref, eiam-r]</code> would remain a single string in the struct, not a list.
+</div>
+
+<h3>What works today</h3>
+<pre><code>upstream:
+  url: '{{ env "MODEL_BACKEND_URL" | default "http://localhost:8080" }}'  # ← scalar string, works
+  auth:
+    value: '{{ secret "API_KEY" | redact }}'  # ← scalar string, works (secret resolves + redact tracks)</code></pre>
+
+<h2>Proposed Solution</h2>
+
+<p>Render Go <code>text/template</code> on the <strong>raw YAML bytes before parsing</strong>:</p>
+
+<pre><code>1. os.ReadFile(path)              → raw []byte
+2. template.Execute(raw, funcMap) → rendered []byte    ← NEW: template runs on raw YAML
+3. yaml.Unmarshal(rendered, &struct) → typed Go struct
+4. (optional) leaf-level render for secret redaction tracking</code></pre>
+
+<p>This matches how Helm's <code>tpl</code> function works: template first, then YAML parse on the output. The rendered bytes must be valid YAML.</p>
+
+<h3>With this change, the example works</h3>
+
+<pre><code># Artifact YAML (no YAML quoting needed — template runs on raw text)
+apiVersion: gateway.api-platform.wso2.com/v1alpha1
+kind: LlmProvider
+metadata:
+  name: ai-model-deepseek
+spec:
+  context: "/ai-model/deepseek/shared/v1"
+  upstream:
+    url: {{ env "MODEL_BACKEND_URL" | required "MODEL_BACKEND_URL must be set" }}
+  policies:
+    - name: jwt-auth
+      version: v1
+      paths:
+        - path: "/*"
+          params:
+            issuers: {{ env "ISSUERS" | required "ISSUERS must be set" }}
+            audiences: {{ env "AUDIENCES" | required "AUDIENCES must be set" }}</code></pre>
+
+<p>With environment variables:</p>
+<pre><code>MODEL_BACKEND_URL=http://deepseek-predictor.bit-ai-models-r.svc.cluster.local:8080/v1
+ISSUERS=[bit-ai-kc-ref, eiam-r, eiam-a]
+AUDIENCES=[bit-ai-gateway, BIT-ai-assistant-dev, BIT-ai-assistant-test]</code></pre>
+
+<p>After template rendering (before YAML parse):</p>
+<pre><code>spec:
+  upstream:
+    url: http://deepseek-predictor.bit-ai-models-r.svc.cluster.local:8080/v1
+  policies:
+    - name: jwt-auth
+      version: v1
+      paths:
+        - path: "/*"
+          params:
+            issuers: [bit-ai-kc-ref, eiam-r, eiam-a]       # ← valid YAML flow sequence
+            audiences: [bit-ai-gateway, BIT-ai-assistant-dev, BIT-ai-assistant-test]</code></pre>
+
+<p>The YAML parser sees valid YAML with real arrays. No special quoting needed.</p>
+
+<h2>Impact</h2>
+
+<h3>What this enables</h3>
+<ul>
+<li><strong>Single API definition file shared across all environments</strong> — per-environment differences (URLs, issuers, audiences, credentials) all resolve from env vars at boot</li>
+<li><strong>Eliminates per-environment file copies</strong> for LlmProvider definitions that differ only in issuers/audiences/backend URL</li>
+<li><strong>Consistent with how Helm works</strong> — Helm renders templates on raw YAML, then parses. Same mental model for chart authors and API definition authors.</li>
+</ul>
+
+<h3>Without this feature (current state)</h3>
+<p>Each environment must carry a <strong>full copy</strong> of every LlmProvider YAML, differing only in 3 fields (upstream URL, issuers array, audiences array). For 5 models across 3 environments = 15 files, with ~90% duplication.</p>
+
+<h3>Backward compatibility</h3>
+<ul>
+<li>Existing artifacts with <code>{{ env "VAR" }}</code> in scalar fields still work — they produce valid YAML strings after rendering</li>
+<li>Artifacts without any <code>{{ }}</code> expressions are unchanged — template rendering on inert text is a no-op</li>
+<li>The <code>redact</code> function would need adaptation — the raw-YAML render pass doesn't have struct-level context for tracking which fields were redacted. A two-pass approach (raw-YAML render + leaf-level redact tracking) would preserve the existing config-dump redaction feature.</li>
+</ul>
+
+<h2>Code Locations (api-platform repo)</h2>
+
+<table>
+<tr><th>What</th><th>Where</th><th>Change needed</th></tr>
+<tr><td>Artifact file read</td><td><code>gateway/gateway-controller/pkg/immutable/loader.go:106</code></td><td>Insert template render between file read and kind-sniff parse</td></tr>
+<tr><td>Template function registry</td><td><code>gateway/gateway-controller/pkg/templateengine/funcs/registry.go:58</code></td><td>Reuse existing <code>env</code>, <code>required</code>, <code>default</code> funcs</td></tr>
+<tr><td>Current leaf-level render</td><td><code>gateway/gateway-controller/pkg/templateengine/spec.go:88-141</code></td><td>Keep for redact tracking, or merge into raw-pass</td></tr>
+<tr><td>YAML parse</td><td><code>gateway/gateway-controller/pkg/config/parser.go:44-58</code></td><td>No change — receives already-rendered bytes</td></tr>
+</table>
+
+<h2>Alternatives Considered</h2>
+
+<table>
+<tr><th>Alternative</th><th>Why rejected</th></tr>
+<tr><td>JSON array in env var + custom <code>fromJson</code> template func</td><td>Adds a new function, requires JSON syntax in env vars, still fails because leaf-level render outputs a string not a list</td></tr>
+<tr><td>Comma-separated env var + custom <code>split</code> template func</td><td>Same problem — even if split produced a list, the render output is placed into a string field, not an array field</td></tr>
+<tr><td>Full-copy per environment</td><td>Works but defeats the purpose of artifact templating. Accepted as the current workaround.</td></tr>
+<tr><td>Kustomize overlays</td><td>Adds toolchain complexity, changes the deployment model, doesn't compose with Helm-based ArgoCD apps</td></tr>
+</table>
+
+<h2>Motivating Real-World Scenario</h2>
+
+<p>We run 5 LlmProvider APIs (deepseek, gpt-oss-120b, nemotron-550b, llamaguard, bgem3) across 3 environment tiers. Each API definition is 45-69 lines. The only differences between environments:</p>
+
+<table>
+<tr><th>Field</th><th>ref tier</th><th>prod tier</th><th>Type</th></tr>
+<tr><td><code>upstream.url</code></td><td><code>http://deepseek-v4-flash-<b>r</b>-predictor.bit-ai-models-<b>r</b>.svc...</code></td><td><code>http://deepseek-v4-flash-<b>p</b>-predictor.bit-ai-models-<b>p</b>.svc...</code></td><td>string (works today)</td></tr>
+<tr><td><code>issuers</code></td><td><code>[bit-ai-kc-ref, eiam-r, eiam-a]</code></td><td><code>[bit-ai-kc-prd, eiam-p]</code></td><td>[]string (broken)</td></tr>
+<tr><td><code>audiences</code></td><td><code>[bit-ai-gateway, BIT-ai-assistant-dev, BIT-ai-assistant-test, BIT-ai-assistant-abn]</code></td><td><code>[bit-ai-gateway, BIT-ai-assistant]</code></td><td>[]string (broken)</td></tr>
+</table>
+
+<p>With raw-YAML templating: 5 files total (one per model), shared across all environments. Without it: 15 files (5 models &times; 3 tiers), ~90% identical content.</p>
+
+</body>
+</html>
